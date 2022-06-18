@@ -572,6 +572,8 @@ enum nvme_opcode {
 	nvme_cmd_isp_insert	= 0x83,
 	nvme_cmd_isp_page_read	= 0x84,
 	nvme_cmd_isp_page_clear	= 0x85,
+	nvme_cmd_isp_stats	= 0x86,
+	nvme_cmd_isp_stats_clear= 0x87,
 	nvme_cmd_specific_end	= 0xFF,
 };
 

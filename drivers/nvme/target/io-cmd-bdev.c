@@ -19,6 +19,13 @@ extern struct nvmet_ebpf ebpf;
 
 extern struct bpf_prog *pblk_bpf_prog;
 
+struct isp_stats{
+	int cpu_usage[16];
+	u64 read_time;
+	u64 ebpf_time;
+};
+
+struct isp_stats stats;
 
 struct pblk_ctx{
 	int param0;
@@ -305,6 +312,11 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 		int npages = bio->bi_max_vecs;
 		int size = 4096;
 		int add_size = 0;
+		int map_idx = req->cmd->common.cdw15;
+		if(map_idx < 0 || map_idx > 15){
+			printk(KERN_EMERG "nvmet: map_idx out of range: %d\n", map_idx);
+			map_idx = 15;
+		}
 		u64 pblk_start_time = 0;
 		u64 pblk_end_time = 0;
 		u64 pblk_read_time = 0;
@@ -323,17 +335,19 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 		submit_bio_wait(bio);
 	  	pblk_end_time = ktime_get_ns();
 	  	pblk_read_time = pblk_end_time - pblk_start_time;
-	  	printk("pblk(ISP) - CPU %d: read request %llu.%lluus\n",cpuid, pblk_read_time/1000, pblk_read_time - (pblk_read_time / 1000) * 1000);
+		stats.read_time += pblk_read_time;
+		stats.cpu_usage[cpuid]++;
+	  	//printk("pblk(ISP) - CPU %d: read request %llu.%lluus\n",cpuid, pblk_read_time/1000, pblk_read_time - (pblk_read_time / 1000) * 1000);
 		/*
 		 * I/O operation finished. Process eBPF program.
 		 */
 		ctx.param0=req->cmd->common.cdw2[0];
 		ctx.param1=req->cmd->common.cdw2[1];
-		ctx.param2=req->cmd->common.cdw12;
+		ctx.param2=0;
 		ctx.param3=0;
 		ctx.param4=0;
 		ctx.data =page_address(pages);
-		ctx.map_page = page_address(ebpf.map_page[0]);
+		ctx.map_page = page_address(ebpf.map_page[map_idx]);
 		ctx.nlb= req->cmd->rw.length+1;
 		start = ktime_get_ns();
 		if(pblk_bpf_prog){
@@ -342,7 +356,8 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 		end = ktime_get_ns();
 		us = (end-start)/1000;
 		ns = (end-start) - us*1000;
-		printk("ISP - CPU %d: eBPF program returned %d: %llu.%lluus\n",cpuid, ret, us, ns);
+		//printk("ISP - CPU %d: eBPF program returned %d: %llu.%lluus\n",cpuid, ret, us, ns);
+		stats.ebpf_time += end - start;
 		nvmet_set_result(req, ret);
 		free_pages((unsigned long)ctx.data,order);
 
@@ -351,9 +366,10 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 			bio_put(bio);
 	}
 	else if (req->cmd->rw.opcode == nvme_cmd_isp_page_clear){
-		void *page = page_address(ebpf.map_page[0]);
+		int map_idx = req->cmd->common.cdw15;
+		void *page = page_address(ebpf.map_page[map_idx]);
 		memset(page,0,4096);
-		printk(KERN_INFO "nvmet: map_page clear issued\n");
+		//printk(KERN_INFO "nvmet: map_page clear issued\n");
 		bio_endio(bio);
 	}
 	else{
@@ -379,8 +395,9 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 			req->bio_issue_time = ktime_get_ns();
 		}*/
 		if (req->cmd->rw.opcode == nvme_cmd_isp_page_read) {
+			int map_idx = req->cmd->common.cdw15;
 			void *data = bio_data(bio);
-			void *page = page_address(ebpf.map_page[0]);
+			void *page = page_address(ebpf.map_page[map_idx]);
 			memcpy(data, page, 4096);
 			bio_endio(bio);
 		}
@@ -388,9 +405,27 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 			submit_bio(bio);
 		}
 	}
-
 }
 
+static void nvmet_bdev_execute_isp_stats(struct nvmet_req *req){	
+	int i;
+	if (req->cmd->rw.opcode == nvme_cmd_isp_stats) {
+		for(i=0;i<16;i++){
+			printk(KERN_INFO "nvmet: CPU %d Usage - %d", i, stats.cpu_usage[i]);
+		}
+		printk(KERN_INFO "NAND Flash read time: %llu\n", stats.read_time);
+		printk(KERN_INFO "eBPF Program execute time: %llu\n", stats.ebpf_time);
+
+	}
+	else if (req->cmd->rw.opcode == nvme_cmd_isp_stats_clear){
+		for(i=0;i<16;i++){
+			stats.cpu_usage[i] = 0;
+		}
+		stats.read_time = 0;
+		stats.ebpf_time = 0;
+	}
+	nvmet_req_complete(req, 0);
+}
 static void nvmet_bdev_execute_flush(struct nvmet_req *req)
 {
 	struct bio *bio = &req->b.inline_bio;
@@ -514,6 +549,11 @@ u16 nvmet_bdev_parse_io_cmd(struct nvmet_req *req)
 		case nvme_cmd_isp_read:
 		case nvme_cmd_isp_page_clear:
 			req->execute = nvmet_bdev_execute_rw;
+			req->data_len = 0;
+			return 0;
+		case nvme_cmd_isp_stats:
+		case nvme_cmd_isp_stats_clear:
+			req->execute = nvmet_bdev_execute_isp_stats;
 			req->data_len = 0;
 			return 0;
 		case nvme_cmd_flush:
